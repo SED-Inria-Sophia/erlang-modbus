@@ -7,6 +7,8 @@
 -module(modbus_device).
 -author('Caleb Tennis <caleb.tennis@gmail.com>').
 
+-compile([{parse_transform, lager_transform}]).
+
 %% Public API
 -export([
 	connect/3,
@@ -29,6 +31,7 @@
 -behavior(gen_server).
 
 -define(TIMEOUT, 3000).
+-define(RETRIES, 2).
 
 %% @doc Function to connect with the modbus device.
 %% @end
@@ -200,7 +203,7 @@ init([Host, Port, DeviceAddr]) ->
 
 	case Retval of
 		{ok, Sock} ->
-			State = #tcp_request{sock = Sock, address = DeviceAddr},
+			State = #tcp_request{sock = Sock, address = DeviceAddr, host=Host, port=Port},
 			{ok, State};
 		{error,ErrorType} ->
 			{stop, {error, ErrorType}}
@@ -213,14 +216,14 @@ handle_call({read_coils, Start, Offset}, _From, State) ->
 		start = Start,
 		data = Offset
 	},
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
 	FinalData = case lists:split(Offset, bytes_to_bits(Data)) of
 		{[Result], _} -> Result;
 		{Result, _} -> Result
 	end,
 
-	{reply, FinalData, NewState};
+	{reply, FinalData, NewState2};
 
 handle_call({read_inputs, Start, Offset}, _From, State) ->
 	NewState = State#tcp_request{
@@ -229,14 +232,14 @@ handle_call({read_inputs, Start, Offset}, _From, State) ->
 		start = Start,
 		data = Offset
 	},
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
 	FinalData = case lists:split(Offset, bytes_to_bits(Data)) of
 		{[Result], _} -> Result;
 		{Result, _} -> Result
 	end,
 
-	{reply, FinalData, NewState};
+	{reply, FinalData, NewState2};
 
 
 handle_call({read_hreg, Start, Offset}, _From, State) ->
@@ -246,11 +249,11 @@ handle_call({read_hreg, Start, Offset}, _From, State) ->
 		start = Start,
 		data = Offset
 	},
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
 	FinalData = bytes_to_words(Data),
 
-	{reply, FinalData, NewState};
+	{reply, FinalData, NewState2};
 
 handle_call({read_ireg,Start, Offset}, _From, State) ->
 	NewState = State#tcp_request{
@@ -259,11 +262,11 @@ handle_call({read_ireg,Start, Offset}, _From, State) ->
 		start = Start,
 		data = Offset
 	},
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
 	FinalData = bytes_to_words(Data),
 
-	{reply, FinalData, NewState};
+	{reply, FinalData, NewState2};
 
 handle_call({read_raw, Start, Offset}, _From, State) ->
 	NewState = State#tcp_request{
@@ -272,9 +275,9 @@ handle_call({read_raw, Start, Offset}, _From, State) ->
 		start = Start,
 		data = Offset
 	},
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
-	{reply, Data, NewState};
+	{reply, Data, NewState2};
 
 handle_call({write_coil, Start, Value}, _From, State) ->
         NewState = State#tcp_request{
@@ -282,8 +285,8 @@ handle_call({write_coil, Start, Value}, _From, State) ->
                      function = ?FC_WRITE_COIL,
                      start = Start, data = Value
                     },
-        {ok, Data} = send_and_receive(NewState),
-	{reply, Data, NewState};
+        {ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
+	{reply, Data, NewState2};
 
 handle_call({write_hreg, Start, OrigData}, _From, State) when is_integer(OrigData) ->
 	NewState = State#tcp_request{
@@ -292,8 +295,8 @@ handle_call({write_hreg, Start, OrigData}, _From, State) when is_integer(OrigDat
 		start = Start,
 		data = OrigData
 	},
-	{ok, Data} = send_and_receive(NewState),
-	{reply, bytes_to_words(Data), NewState};
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
+	{reply, bytes_to_words(Data), NewState2};
 
 handle_call({write_hregs, Start, OrigData}, _From, State) ->
 	NewState = State#tcp_request{
@@ -303,11 +306,11 @@ handle_call({write_hregs, Start, OrigData}, _From, State) ->
 		data = OrigData
 	},
 
-	{ok, Data} = send_and_receive(NewState),
+	{ok, Data, NewState2} = send_and_receive_with_retry(NewState, ?RETRIES),
 
 	FinalData = bytes_to_words(Data),
 
-	{reply, FinalData, NewState}.
+	{reply, FinalData, NewState2}.
 
 
 handle_cast(stop, State) ->
@@ -331,8 +334,24 @@ code_change(_OldVsn, State, _Extra) ->
 %% Util
 %%% %%% -------------------------------------------------------------------
 
-send_and_receive(State) ->
+send_and_receive_with_retry(State, 0) ->
+        lager:error("No more retry for tcp, abort"),
+        {error, too_many_retries, State};
+send_and_receive_with_retry(State=#tcp_request{address=DeviceAddr, host=Host, port=Port, function=Fun, data=Data, start=Start}, Retry) ->
+    try send_and_receive(State) of
+            {ok, NewData } ->
+                    {ok, NewData, State}
+    catch
+            error:{badmatch, {error, closed}} ->
+                    lager:warning("error, closed connection, try to reconnect ~p",[State]),
+                    {ok, NewState} = init([Host, Port, DeviceAddr]),
+                    lager:notice("Reconnected ~p",[NewState]),
+                    send_and_receive_with_retry(NewState#tcp_request{tid=1,data=Data,start=Start,function=Fun}, Retry-1);
+            Error:Reason ->
+                    {Error,Reason,State}
+    end.
 
+send_and_receive(State) ->
 	ok = modbus:send_request_message(State),
 	ok = modbus:get_response_header(State),
 	{ok, _Data} = modbus:get_response_data(State).
